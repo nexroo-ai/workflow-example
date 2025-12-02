@@ -1,0 +1,242 @@
+{
+  "addons": [
+    {
+      "id": "claude-rag",
+      "type": "anthropic",
+      "name": "Claude RAG Assistant",
+      "description": "Claude AI for RAG query answering",
+      "enabled": true,
+      "config": {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 4096,
+        "temperature": 0.7
+      },
+      "secrets": {
+        "anthropic_api_key": "ANTHROPIC_API_KEY"
+      }
+    },
+    {
+      "id": "drive-docs",
+      "type": "google_drive",
+      "name": "Google Drive Document Source",
+      "description": "Fetch documents from Google Drive for RAG indexing",
+      "enabled": true,
+      "config": {
+        "page_size": 100,
+        "max_page_size": 1000,
+        "max_download_size_mb": 50
+      },
+      "secrets": {
+        "google_drive_access_token": "ENV_GOOGLE_DRIVE_TOKEN"
+      }
+    },
+    {
+      "id": "qdrant-vectors",
+      "type": "qdrant",
+      "name": "Qdrant Vector Database",
+      "description": "Vector storage for document embeddings",
+      "enabled": true,
+      "config": {
+        "url": "http://localhost:6333",
+        "prefer_grpc": false,
+        "timeout": 60
+      },
+      "secrets": {
+      }
+    },
+    {
+      "id": "voyage-embeddings",
+      "type": "voyageai",
+      "name": "VoyageAI Embeddings",
+      "description": "Generate embeddings for documents and queries",
+      "enabled": true,
+      "config": {
+        "model": "voyage-3.5",
+        "input_type": "document",
+        "embedding_dimension": 1024
+      },
+      "secrets": {
+        "voyage_api_key": "VOYAGE_API_KEY"
+      }
+    }
+  ],
+  "entrypoints": [
+    {
+      "id": "index",
+      "name": "Index Documents from Google Drive",
+      "startAt": "create-collection",
+      "guards": [
+        {
+          "condition": "{{payload.content.folder_id}} != ''",
+          "error": "folder_id is required for indexing"
+        }
+      ]
+    },
+    {
+      "id": "query",
+      "name": "RAG Query",
+      "startAt": "embed-query",
+      "guards": [
+        {
+          "condition": "{{payload.content.question}} != ''",
+          "error": "question is required for querying"
+        }
+      ]
+    }
+  ],
+  "workflow": {
+    "id": "rag-api-workflow",
+    "name": "RAG API Workflow",
+    "version": "1.0.0",
+    "description": "Complete RAG workflow with Google Drive indexing and Claude query answering",
+    "steps": [
+      {
+        "id": "create-collection",
+        "name": "Create Qdrant Collection",
+        "action": "qdrant-vectors::create_collection",
+        "runLimit": 1,
+        "parameters": {
+          "collection_name": "{{payload.content.collection_name}}",
+          "vector_size": 1024,
+          "distance": "Cosine",
+          "if_exists": "skip"
+        },
+        "next": ["list-drive-documents"]
+      },
+      {
+        "id": "list-drive-documents",
+        "name": "List Documents from Google Drive",
+        "action": "drive-docs::list_documents",
+        "runLimit": 1,
+        "parameters": {
+          "folder_id": "{{payload.content.folder_id}}",
+          "include_trashed": false
+        },
+        "next": ["process-documents"]
+      },
+      {
+        "id": "process-documents",
+        "name": "Process Each Document",
+        "action": "logic::loop",
+        "runLimit": 1,
+        "parameters": {
+          "items": "{{list-drive-documents.output.data.files}}"
+        },
+        "next": ["download-document"]
+      },
+      {
+        "id": "download-document",
+        "name": "Download Document from Drive",
+        "action": "drive-docs::download_document",
+        "runLimit": 100,
+        "parameters": {
+          "fileId": "{{loop_item.id}}",
+          "export_mime_type": "text/plain"
+        },
+        "next": ["embed-document"]
+      },
+      {
+        "id": "embed-document",
+        "name": "Generate Document Embedding",
+        "action": "voyage-embeddings::embed",
+        "runLimit": 100,
+        "parameters": {
+          "texts": "{{download-document.output.data.content_base64}}",
+          "input_type": "document"
+        },
+        "next": ["store-in-qdrant"]
+      },
+      {
+        "id": "store-in-qdrant",
+        "name": "Store Embedding in Qdrant",
+        "action": "qdrant-vectors::upsert_points",
+        "runLimit": 100,
+        "parameters": {
+          "collection_name": "{{payload.content.collection_name}}",
+          "points": [
+            {
+              "id": "{{loop_item.id}}",
+              "vector": "{{embed-document.output.embeddings[0]}}",
+              "payload": {
+                "file_id": "{{loop_item.id}}",
+                "file_name": "{{loop_item.name}}",
+                "mime_type": "{{loop_item.mimeType}}",
+                "web_view_link": "{{loop_item.webViewLink}}",
+                "modified_time": "{{loop_item.modifiedTime}}"
+              }
+            }
+          ]
+        },
+        "next": ["log-indexed-document"]
+      },
+      {
+        "id": "log-indexed-document",
+        "name": "Log Indexed Document",
+        "action": "builtin::log",
+        "runLimit": 100,
+        "parameters": {
+          "message": "Indexed document: {{loop_item.name}} ({{loop_item.id}})",
+          "level": "info"
+        }
+      },
+      {
+        "id": "embed-query",
+        "name": "Generate Query Embedding",
+        "action": "voyage-embeddings::embed",
+        "runLimit": 1,
+        "parameters": {
+          "texts": "{{payload.content.question}}",
+          "input_type": "query"
+        },
+        "next": ["search-qdrant"]
+      },
+      {
+        "id": "search-qdrant",
+        "name": "Search Similar Documents",
+        "action": "qdrant-vectors::search_points",
+        "runLimit": 1,
+        "parameters": {
+          "collection_name": "{{payload.content.collection_name}}",
+          "query_vector": "{{embed-query.output.embeddings[0]}}",
+          "limit": 5,
+          "score_threshold": 0.7
+        },
+        "next": ["build-context"]
+      },
+      {
+        "id": "build-context",
+        "name": "Build Context from Search Results",
+        "action": "builtin::transform",
+        "runLimit": 1,
+        "parameters": {
+          "input": "{{search-qdrant.output.results}}",
+          "rules": {
+            "context": "{{input.map(item => 'Document: ' + item.payload.file_name + '\\nLink: ' + item.payload.contentweb_view_link + '\\nScore: ' + item.score).join('\\n\\n')}}"
+          }
+        },
+        "next": ["generate-rag-answer"]
+      },
+      {
+        "id": "generate-rag-answer",
+        "name": "Generate RAG Answer with Claude",
+        "action": "claude-rag::chat_completion",
+        "runLimit": 1,
+        "parameters": {
+          "message": "{{payload.content.question}}",
+          "system": "You are a helpful assistant that answers questions based on provided document context. Use the following context to answer the user's question. If the context doesn't contain relevant information, say so.\n\nContext:\n{{build-context.output.context}}"
+        },
+        "next": ["log-rag-response"]
+      },
+      {
+        "id": "log-rag-response",
+        "name": "Log RAG Response",
+        "action": "builtin::log",
+        "runLimit": 1,
+        "parameters": {
+          "message": "RAG query completed. Question: {{payload.content.question}} | Answer: {{generate-rag-answer.output.response}}",
+          "level": "info"
+        }
+      }
+    ]
+  }
+}
