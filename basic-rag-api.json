@@ -24,7 +24,7 @@
       "config": {
         "page_size": 100,
         "max_page_size": 1000,
-        "max_download_size_mb": 50
+        "max_download_size_mb": 150
       },
       "secrets": {
         "google_drive_access_token": "ENV_GOOGLE_DRIVE_TOKEN"
@@ -37,7 +37,11 @@
       "description": "Vector storage for document embeddings",
       "enabled": true,
       "config": {
-        "url": "http://localhost:6333",
+        "url": {
+          "__type": "string",
+          "__description": "Qdrant server URL (default: http://localhost:6333)",
+          "__default": "http://localhost:6333"
+        },
         "prefer_grpc": false,
         "timeout": 60
       },
@@ -211,11 +215,32 @@
         "parameters": {
           "input": "{{search-qdrant.output.results}}",
           "rules": {
-            "context": "{{input.map(item => 'Document: ' + item.payload.file_name + '\\nLink: ' + item.payload.contentweb_view_link + '\\nScore: ' + item.score).join('\\n\\n')}}"
+            "context": "{{input.map(item => 'Document: ' + item.payload.file_name + '\\nLink: ' + item.payload.web_view_link + '\\nScore: ' + item.score).join('\\n\\n')}}"
+          }
+        },
+        "next": ["concat-system-and-context"]
+      },
+      {
+        "id": "concat-system-and-context",
+        "name": "Concat System and Context",
+        "action": "builtin::transform",
+        "runLimit": 1,
+        "parameters": {
+          "input": {
+            "custom_prompt": {
+              "__type": "string",
+              "__description": "Custom system prompt for RAG generation",
+              "__required": true
+            },
+            "document_context": "{{build-context.output.context}}"
+          },
+          "rules": {
+            "system_with_context": "{{input.custom_prompt}}\n\nContext from documents:\n{{input.document_context}}"
           }
         },
         "next": ["generate-rag-answer"]
       },
+
       {
         "id": "generate-rag-answer",
         "name": "Generate RAG Answer with Claude",
@@ -223,7 +248,7 @@
         "runLimit": 1,
         "parameters": {
           "message": "{{payload.content.question}}",
-          "system": "You are a helpful assistant that answers questions based on provided document context. Use the following context to answer the user's question. If the context doesn't contain relevant information, say so.\n\nContext:\n{{build-context.output.context}}"
+          "system": "{{concat-system-and-context.output.transformed.system_with_context}}"
         },
         "next": ["log-rag-response"]
       },
